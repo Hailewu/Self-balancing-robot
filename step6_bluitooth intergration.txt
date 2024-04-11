@@ -1,0 +1,198 @@
+import time
+import board
+import math
+import pwmio
+import countio
+from adafruit_motor import motor
+import adafruit_icm20x
+import busio
+
+# Initialize UART for Bluetooth communication
+uart = busio.UART(board.TX, board.RX, baudrate=9600)
+
+class rotaryEncoder:
+    def __init__(self, encoderPin, encoderSlots):
+        self.encoder = countio.Counter(encoderPin)
+        self.encoderSlots = encoderSlots
+        self.speed = 0
+        self.direction = 1  # 1 for forward, -1 for reverse
+        self.speedQueue = [0] * 10
+        self.averageSpeed = 0
+        self.lastTimeSensorUpdated = time.monotonic()
+        self.noCountDurationThreshold = 0.1  # Duration in seconds to consider as stopped.
+        self.lastCountTime = time.monotonic()
+
+    def updateDirection(self, direction):
+        # direction should be 1 for forward and -1 for reverse
+        self.direction = direction
+        #print(f"Encoder direction updated to: {direction}")  # Debug print
+
+    def checkForCounts(self):
+        now = time.monotonic()
+        deltaT = now - self.lastTimeSensorUpdated
+        if self.encoder.count > 0:
+            #print(f"Current direction: {self.direction}")  # Debug print
+            self.speed = self.direction * ((self.encoder.count / self.encoderSlots) / deltaT) * 60
+            self.encoder.reset()
+            self.lastCountTime = now
+        elif now - self.lastCountTime > self.noCountDurationThreshold:
+            # If no counts for a while, consider stopped.
+            self.speed = 0
+
+        self.lastTimeSensorUpdated = now
+        self.speedQueue.pop(0)
+        self.speedQueue.append(self.speed)
+        self.averageSpeed = sum(self.speedQueue) / len(self.speedQueue)
+
+
+# Secondary PID coefficients and variables for drift correction
+Kp_pos = 1.0
+Ki_pos = 0.04
+Kd_pos = 0.0
+integral_pos = 0.0
+prev_error_pos = 0.0
+setpoint_pos = 0.0  # Assuming the target is to maintain a stationary position
+adjustment_threshold = 10.0  # The minimum drift speed (in RPM) that triggers correction
+adjustment_interval = 0.1  # Time in seconds between adjustments
+last_adjustment_time = time.monotonic()  # Tracks the last time an adjustment was made
+
+# Initialize systems
+i2c = board.I2C()
+icm = adafruit_icm20x.ICM20948(i2c)
+pin_M1A = pwmio.PWMOut(board.D4, frequency=1600)
+pin_M1B = pwmio.PWMOut(board.D7, frequency=1600)
+motor_m1 = motor.DCMotor(pin_M1A, pin_M1B)
+pin_M2A = pwmio.PWMOut(board.D13, frequency=1600)
+pin_M2B = pwmio.PWMOut(board.D10, frequency=1600)
+motor_m2 = motor.DCMotor(pin_M2A, pin_M2B)
+encoderL = rotaryEncoder(board.D3, 20)
+encoderR = rotaryEncoder(board.D2, 20)
+
+
+def set_motors_speed(motor1, motor2, speed):
+    global motor_direction  # If you're using a global variable to track this
+
+    # Determine direction based on the speed value
+    motor_direction = 1 if speed > 0 else -1
+
+    # Update encoder direction(s) based on motor direction
+    encoderL.updateDirection(motor_direction)
+    encoderR.updateDirection(motor_direction)  # If you have a second encoder
+
+    speed = max(min(speed, 0.7), -0.7)
+    motor1.throttle = speed
+    motor2.throttle = speed
+
+# PID setup
+Kp = 0.6
+Ki = 0.3
+Kd = 0.02
+integral = 0.0
+prev_error = 0.0
+desired_angle = 0.0
+scaling_factor = 0.5
+integral_limit = 1.0
+alpha = 0.1  # Filtering factor
+last_correction_filtered = 0.0
+current_angle = 0.0
+
+consistency_counter = 0
+previous_joystick_value = 130  # Assuming neutral starting point
+
+max_setpoint_deviation = 3.2  # Example value, adjust based on your requirements
+
+return_to_zero_enabled = False  # Flag to enable the return-to-zero mode.
+return_to_zero_rate = 1.5  # How quickly to adjust the setpoint back to zero in this mode.
+velocity_threshold = 45.0  # Speed threshold in RPM for considering minimal movement
+stability_duration_required = 0.1  # Required duration in seconds for considering the system stable
+last_stable_time = time.monotonic()  # Track the last time the system was considered stable
+
+prev_time = time.monotonic()
+current_angle = 0.0
+
+while True:
+    now_time = time.monotonic()
+    interval = now_time - prev_time if prev_time else 0
+    prev_time = now_time
+
+    # IMU and primary PID calculations
+    acc = icm.acceleration
+    acc_angle = math.atan2(acc[0], acc[2]) * 180. / math.pi
+    gyroscope = icm.gyro
+    gyro_y = -gyroscope[1] * 180. / math.pi
+
+    current_angle = 0.95 * (current_angle + gyro_y * interval) + 0.05 * acc_angle
+
+    error = desired_angle - current_angle
+    integral += error * interval
+    integral = max(min(integral, integral_limit), -integral_limit)
+    derivative = (error - prev_error) / interval if interval > 0 else 0
+    correction = -(Kp * error + Ki * integral + Kd * derivative) * scaling_factor
+    prev_error = error
+    correction_filtered = alpha * correction + (1 - alpha) * last_correction_filtered
+    last_correction_filtered = correction_filtered
+    set_motors_speed(motor_m1, motor_m2, correction_filtered)
+
+    # Bluetooth control for adjusting desired_angle
+    if uart.in_waiting >= 2:
+        data = uart.read(2)
+        if data:
+            joystick_forward_backward = int(data[0])
+
+            if abs(joystick_forward_backward - previous_joystick_value) < 10:
+                consistency_counter += 1
+            else:
+                consistency_counter = 0
+
+            previous_joystick_value = joystick_forward_backward
+
+            if consistency_counter > 1:  # Adjust based on required consistency
+                # Proceed with adjustments
+                desired_angle_adjustment = (joystick_forward_backward - 128) * 0.1
+                desired_angle += desired_angle_adjustment
+
+    # Encoder reading and secondary PID loop for drift correction
+    encoderL.checkForCounts()
+    encoderR.checkForCounts()
+    average_velocity = (encoderL.averageSpeed + encoderR.averageSpeed) / 2
+    error_pos = setpoint_pos - average_velocity
+    integral_pos += error_pos * interval
+    integral_pos = max(min(integral_pos, integral_limit), -integral_limit)
+    derivative_pos = (error_pos - prev_error_pos) / interval if interval > 0 else 0
+    pos_adjustment = Kp_pos * error_pos + Ki_pos * integral_pos + Kd_pos * derivative_pos
+    prev_error_pos = error_pos
+
+     # Apply pos_adjustment conditionally based on the threshold and interval
+    time_since_last_adjustment = now_time - last_adjustment_time
+    if abs(pos_adjustment) > adjustment_threshold and time_since_last_adjustment > adjustment_interval:
+        desired_angle += pos_adjustment * 0.1  # Apply a fraction of the adjustment for subtlety
+        last_adjustment_time = now_time  # Update the last adjustment time
+
+    desired_angle = max(min(desired_angle, max_setpoint_deviation), -max_setpoint_deviation)
+
+    #check for stability to trigger return to zero mode
+    if abs(average_velocity) < velocity_threshold:
+        if now_time - last_stable_time > stability_duration_required:
+            return_to_zero_enabled = True
+    else:
+        last_stable_time = now_time  # Reset the timer if conditions are not met
+
+    #return to zero
+    if return_to_zero_enabled:
+        if desired_angle > 0:
+            desired_angle -= return_to_zero_rate
+        elif desired_angle < 0:
+            desired_angle += return_to_zero_rate
+        if abs(desired_angle) < return_to_zero_rate:
+            desired_angle = 0  # Reset to zero if close enough.
+            return_to_zero_enabled = False  # Disable mode once complete.
+
+    # Execute motor control with the adjusted desired angle through the primary PID loop
+    set_motors_speed(motor_m1, motor_m2, correction_filtered)
+
+    # Debugging output - might include speeds, PID errors, corrections, etc.
+    print(f"Encoder L Speed: {encoderL.averageSpeed} RPM, Encoder R Speed: {encoderR.averageSpeed} RPM")
+    print(f"Setpoint (Desired Angle): {desired_angle}")
+    print(f"Actual Angle: {current_angle:.2f} degrees")  # Add this line to print the actual angle
+    # Pause briefly to manage loop timing and processor load
+    time.sleep(0.04)
